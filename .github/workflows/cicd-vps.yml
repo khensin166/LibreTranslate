@@ -1,0 +1,116 @@
+name: Build & Deploy LibreTranslate to VPS
+
+on:
+  push:
+    branches: [ "main" ]
+    paths-ignore:
+      - 'README.md'
+      - 'CONTRIBUTING.md'
+      - 'TRADEMARK.md'
+      - 'LICENSE'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ==========================================
+  # JOB 1: BUILD & PUSH DOCKER IMAGE TO GHCR
+  # ==========================================
+  build_image:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set lowercase repository image name
+        run: echo "IMAGE_NAME=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the Container registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short
+            type=raw,value=latest
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ==========================================
+  # JOB 2: DEPLOY DOCKER CONTAINER TO VPS
+  # ==========================================
+  deploy_to_vps:
+    name: Deploy to Production VPS
+    needs: build_image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup SSH Connection to VPS
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.VPS_SSH_KEY || vars.VPS_SSH_KEY }}" | tr -d '\r' > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ vars.VPS_IP }} >> ~/.ssh/known_hosts
+
+      - name: Copy Deployment Config to VPS
+        run: |
+          # Create dedicated directory on VPS
+          ssh -o StrictHostKeyChecking=no ${{ vars.VPS_USER }}@${{ vars.VPS_IP }} "mkdir -p /home/${{ vars.VPS_USER }}/libretranslate"
+
+          # Transfer custom docker-compose file with resource limits
+          scp -o StrictHostKeyChecking=no docker-compose.deploy.yml ${{ vars.VPS_USER }}@${{ vars.VPS_IP }}:/home/${{ vars.VPS_USER }}/libretranslate/docker-compose.yml
+
+      - name: Pull & Restart LibreTranslate on VPS
+        run: |
+          LOWER_REPO=$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]')
+          TARGET_IMAGE="${{ env.REGISTRY }}/${LOWER_REPO}:latest"
+
+          ssh -o StrictHostKeyChecking=no ${{ vars.VPS_USER }}@${{ vars.VPS_IP }} << 'EOF'
+            set -e
+            cd /home/${{ vars.VPS_USER }}/libretranslate
+
+            # Login to GitHub Container Registry to pull the image
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+            # Pull and restart LibreTranslate with strict resource limits and ID,EN only
+            export IMAGE_NAME="ghcr.io/$(echo ${{ github.repository }} | tr '[:upper:]' '[:lower:]'):latest"
+            docker compose pull
+            docker compose up -d --remove-orphans
+
+            # Clean dangling images to save VPS disk space
+            docker image prune -f
+
+            # Verify container health
+            sleep 5
+            docker ps --filter "name=libretranslate"
+          EOF
