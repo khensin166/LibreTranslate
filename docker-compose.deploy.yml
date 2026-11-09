@@ -38,8 +38,15 @@ services:
       timeout: 5s
       retries: 5
       start_period: 45s
+    networks:
+      - muter_net
 
 volumes:
   libretranslate_models:
     name: libretranslate_models
+
+networks:
+  muter_net:
+    name: muter_net
+    external: true
 
